@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Harbor version tag (e.g. v2.14.2) — leave blank for latest stable'
+        description: "Harbor version tag (e.g. v2.14.2) — leave blank for latest stable"
         required: false
 
 jobs:
@@ -43,27 +43,28 @@ jobs:
 
     steps:
       - name: Checkout harbor-arm64 (patches and config)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.3.0
 
       - name: Checkout Harbor source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.3.0
         with:
           repository: goharbor/harbor
           ref: ${{ env.HARBOR_VERSION }}
           path: harbor-src
-
       - name: Read versions from Harbor Makefile
         run: |
           TRIVY_VERSION=$(grep "^TRIVYVERSION=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
           TRIVY_ADAPTER_VERSION=$(grep "^TRIVYADAPTERVERSION=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
           GOLANG_IMAGE=$(grep "^GOBUILDIMAGE=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
+          SWAGGER_VERSION=$(grep "^SWAGGER_VERSION=" "$HARBOR_SRC/Makefile" | cut -d= -f2)
           echo "TRIVY_VERSION=$TRIVY_VERSION" >> $GITHUB_ENV
           echo "TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION" >> $GITHUB_ENV
           echo "GOLANG_IMAGE=$GOLANG_IMAGE" >> $GITHUB_ENV
-          echo "Resolved: TRIVY_VERSION=$TRIVY_VERSION, TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION, GOLANG_IMAGE=$GOLANG_IMAGE"
+          echo "SWAGGER_VERSION=$SWAGGER_VERSION" >> $GITHUB_ENV
+          echo "Resolved: TRIVY_VERSION=$TRIVY_VERSION, TRIVY_ADAPTER_VERSION=$TRIVY_ADAPTER_VERSION, GOLANG_IMAGE=$GOLANG_IMAGE, SWAGGER_VERSION=$SWAGGER_VERSION"
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -78,6 +79,16 @@ jobs:
       # -------------------------------------------------------------------
       - name: Build base images
         run: |
+          push_with_retry() {
+            local target="$1" attempt=0
+            until docker push "$target"; do
+              attempt=$((attempt + 1))
+              [ "$attempt" -ge 3 ] && { echo "Failed to push $target after $attempt attempts"; return 1; }
+              echo "Push failed, retrying ($attempt/3) in 30s..."
+              sleep 30
+            done
+          }
+
           declare -A BASE_IMAGES=(
             ["harbor-nginx-base"]="nginx"
             ["harbor-redis-base"]="redis"
@@ -98,7 +109,7 @@ jobs:
               -f "$HARBOR_SRC/make/photon/$dir/Dockerfile.base" \
               -t "$target" \
               "$HARBOR_SRC"
-            docker push "$target"
+            push_with_retry "$target"
           done
 
       # -------------------------------------------------------------------
@@ -106,19 +117,28 @@ jobs:
       # -------------------------------------------------------------------
       - name: Generate API code
         run: |
-          SWAGGER_IMAGE="harbor-swagger-arm64:v0.31.0"
-          docker build -t "$SWAGGER_IMAGE" - <<'EOF'
-          FROM golang:1.22
-          RUN go install github.com/go-swagger/go-swagger/cmd/swagger@v0.31.0
+          SWAGGER_IMAGE="harbor-swagger-arm64:${SWAGGER_VERSION}"
+          # Derive the minimum Go version required by this go-swagger release from its go.mod.
+          SWAGGER_GO_VERSION=$(curl -sf \
+            "https://raw.githubusercontent.com/go-swagger/go-swagger/${SWAGGER_VERSION}/go.mod" \
+            | awk '/^go / {print $2}')
+          echo "go-swagger ${SWAGGER_VERSION} requires Go ${SWAGGER_GO_VERSION}"
+          docker build -t "$SWAGGER_IMAGE" - <<EOF
+          FROM golang:${SWAGGER_GO_VERSION}
+          RUN go install github.com/go-swagger/go-swagger/cmd/swagger@${SWAGGER_VERSION}
           ENTRYPOINT ["/go/bin/swagger"]
           EOF
 
+          # Use Harbor's custom templates so that HandlerAPI/PreheatAPI/Config types
+          # are generated correctly. The old interface{} vs *interface{} mismatch that
+          # previously prevented using --template-dir was a go-swagger v0.31 issue;
+          # v0.33+ uses `any` consistently so there is no type mismatch with Go 1.25.
           docker run --rm \
             -v "$HARBOR_SRC":/harbor \
             -w /harbor \
             "$SWAGGER_IMAGE" \
             generate server \
-            --template-dir=/harbor/tools/swagger/templates \
+            --template-dir /harbor/tools/swagger/templates \
             --exclude-main \
             --skip-validation \
             --additional-initialism=CVE \
@@ -141,19 +161,19 @@ jobs:
       - name: Compile Go binaries
         run: |
           docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/core "$GOLANG_IMAGE" \
-            /usr/local/go/bin/go build -buildvcs=false --ldflags "-w -s" \
+            /usr/local/go/bin/go build -buildvcs=false -mod=mod --ldflags "-w -s" \
             -o /harbor/make/photon/core/harbor_core
 
           docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/jobservice "$GOLANG_IMAGE" \
-            /usr/local/go/bin/go build -buildvcs=false \
+            /usr/local/go/bin/go build -buildvcs=false -mod=mod \
             -o /harbor/make/photon/jobservice/harbor_jobservice
 
           docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/registryctl "$GOLANG_IMAGE" \
-            /usr/local/go/bin/go build -buildvcs=false \
+            /usr/local/go/bin/go build -buildvcs=false -mod=mod \
             -o /harbor/make/photon/registryctl/harbor_registryctl
 
           docker run --rm -v "$HARBOR_SRC":/harbor -w /harbor/src/cmd/exporter "$GOLANG_IMAGE" \
-            /usr/local/go/bin/go build -buildvcs=false \
+            /usr/local/go/bin/go build -buildvcs=false -mod=mod \
             -o /harbor/make/photon/exporter/harbor_exporter
 
       # -------------------------------------------------------------------
@@ -234,6 +254,16 @@ jobs:
       # -------------------------------------------------------------------
       - name: Build harbor-portal
         run: |
+          push_with_retry() {
+            local target="$1" attempt=0
+            until docker push "$target"; do
+              attempt=$((attempt + 1))
+              [ "$attempt" -ge 3 ] && { echo "Failed to push $target after $attempt attempts"; return 1; }
+              echo "Push failed, retrying ($attempt/3) in 30s..."
+              sleep 30
+            done
+          }
+
           docker build \
             -f "$HARBOR_SRC/make/photon/portal/Dockerfile" \
             --build-arg harbor_base_namespace="$BASE_NS" \
@@ -241,7 +271,7 @@ jobs:
             --build-arg NODE=node:16.18.0 \
             -t "$BASE_NS/harbor-portal:$TAG" \
             "$HARBOR_SRC"
-          docker push "$BASE_NS/harbor-portal:$TAG"
+          push_with_retry "$BASE_NS/harbor-portal:$TAG"
 
       # -------------------------------------------------------------------
       # Step 8: Build final component images
@@ -250,13 +280,23 @@ jobs:
         run: |
           BUILD_ARGS="--build-arg harbor_base_namespace=$BASE_NS --build-arg harbor_base_image_version=$TAG"
 
+          push_with_retry() {
+            local target="$1" attempt=0
+            until docker push "$target"; do
+              attempt=$((attempt + 1))
+              [ "$attempt" -ge 3 ] && { echo "Failed to push $target after $attempt attempts"; return 1; }
+              echo "Push failed, retrying ($attempt/3) in 30s..."
+              sleep 30
+            done
+          }
+
           build_and_push() {
             local component="$1" image_name="$2"
             local target="$BASE_NS/$image_name:$TAG"
             echo "Building $target"
             docker build -f "$HARBOR_SRC/make/photon/$component/Dockerfile" \
               $BUILD_ARGS -t "$target" "$HARBOR_SRC"
-            docker push "$target"
+            push_with_retry "$target"
           }
 
           build_and_push "nginx"          "nginx-photon"
@@ -282,7 +322,7 @@ jobs:
           EXPOSE 6379
           CMD ["redis-server", "--protected-mode", "no", "--save", ""]
           REDIS_EOF
-          docker push "$BASE_NS/redis-photon:$TAG"
+          push_with_retry "$BASE_NS/redis-photon:$TAG"
 
           build_and_push "db"             "harbor-db"
           build_and_push "core"           "harbor-core"
@@ -296,7 +336,7 @@ jobs:
             --build-arg trivy_version="$TRIVY_VERSION" \
             -t "$BASE_NS/trivy-adapter-photon:$TAG" \
             "$HARBOR_SRC"
-          docker push "$BASE_NS/trivy-adapter-photon:$TAG"
+          push_with_retry "$BASE_NS/trivy-adapter-photon:$TAG"
 
           # Exporter: upstream Dockerfile hardcodes amd64, use single-stage with pre-built binary
           docker build \
@@ -319,7 +359,7 @@ jobs:
           USER harbor
           ENTRYPOINT ["/harbor/entrypoint.sh"]
           EXPORTER_EOF
-          docker push "$BASE_NS/harbor-exporter:$TAG"
+          push_with_retry "$BASE_NS/harbor-exporter:$TAG"
 
       # -------------------------------------------------------------------
       # Cleanup builder images from the runner
@@ -327,5 +367,5 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rmi -f harbor-swagger-arm64:v0.31.0 || true
+          docker rmi -f "harbor-swagger-arm64:${SWAGGER_VERSION}" || true
           docker image prune -f || true
