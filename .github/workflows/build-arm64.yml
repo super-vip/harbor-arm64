@@ -75,6 +75,26 @@ jobs:
           echo "TAG=$HARBOR_VERSION" >> $GITHUB_ENV
 
       # -------------------------------------------------------------------
+      # Step 0: Build ARM64 photon base if upstream doesn't provide one
+      # goharbor/photon:5.0 on Docker Hub is currently amd64-only. If that
+      # ever gains an arm64 manifest this step becomes a no-op automatically.
+      # -------------------------------------------------------------------
+      - name: Check goharbor/photon:5.0 ARM64 availability
+        id: photon_check
+        run: |
+          has_arm64=$(curl -sf "https://hub.docker.com/v2/repositories/goharbor/photon/tags/5.0" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if any(i.get('architecture')=='arm64' for i in d.get('images',[])) else 'false')")
+          echo "has_arm64=$has_arm64" >> $GITHUB_OUTPUT
+
+      - name: Build ARM64 photon base
+        if: steps.photon_check.outputs.has_arm64 == 'false'
+        run: |
+          docker build -t goharbor/photon:5.0 - <<'EOF'
+          FROM photon:5.0
+          RUN tdnf update -y && tdnf clean all
+          EOF
+
+      # -------------------------------------------------------------------
       # Step 1: Base images (photon + packages)
       # -------------------------------------------------------------------
       - name: Build base images
